@@ -35,7 +35,7 @@ Agent plane (separate process)
 The proxy never imports `agent/`. The agent never imports `proxy/cache.py`
 or `proxy/main.py`. They communicate only through three Postgres tables.
 
-![TokenOps Architecture](../../architecture.png)
+![TokenOps Architecture](architecture.png)
 
 ## Quick start
 
@@ -69,8 +69,8 @@ modal deploy modal_app/embedder.py
 This deploys `BAAI/bge-small-en-v1.5` (384-dim, normalized) as a persistent cloud function. The proxy calls it via modal.Function.from_name() with a 4-second timeout.
 
 ### Dashboard Preview:
-![Streamlit Dashboard 1](../../streamlit1.png)
-![Streamlit Dashboard 2](../../streamlit2.png)
+![Streamlit Dashboard 1](streamlit1.png)
+![Streamlit Dashboard 2](streamlit2.png)
 
 Dev dependencies (`pytest`, `pytest-asyncio`) live in `requirements-dev.txt`;
 install them in addition to `requirements.txt`.
