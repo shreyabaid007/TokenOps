@@ -1,0 +1,44 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.9.0
+    container_name: tokenops-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: tokenops-postgres
+    environment:
+      POSTGRES_USER: tokenops
+      POSTGRES_PASSWORD: tokenops
+      POSTGRES_DB: tokenops
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Auto-apply the schema on first volume init. The postgres image runs
+      # any *.sql / *.sh in /docker-entrypoint-initdb.d/ exactly once, when
+      # the data directory is empty. To re-apply later: docker compose down -v
+      # (wipes the volume) and bring the stack back up.
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tokenops -d tokenops"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:
+  postgres_data:
