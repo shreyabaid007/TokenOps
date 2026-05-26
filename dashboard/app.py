@@ -404,9 +404,6 @@ else:
     )
 
 
-# Auto-refresh via time.sleep + st.rerun() was removed for the Modal-hosted
-# deployment: the rerun fires before partial frames flush through Modal's
-# HTTP proxy, leaving the page stuck rendering skeletons. Manual browser
-# refresh fetches fresh data. The `refresh` sidebar control is preserved
-# so this is a one-line revert if the loop is needed locally.
-_ = refresh
+# ----------------------------------------------------------------- auto-refresh
+time.sleep(refresh)
+st.rerun()
