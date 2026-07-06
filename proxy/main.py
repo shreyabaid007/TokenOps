@@ -19,6 +19,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Header, HTTPException, status
+from fastapi.responses import JSONResponse
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import (
     AIMessage,
@@ -126,8 +127,6 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     messages: list[ChatMessage]
     tag: str | None = None
-    # `model` accepted for OpenAI-API compatibility but ignored — the proxy
-    # chooses based on the classifier tier.
     model: str | None = None
 
 
@@ -142,13 +141,19 @@ class ChatChoice(BaseModel):
     finish_reason: str
 
 
+class UsageInfo(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
 class ChatResponse(BaseModel):
-    choices: list[ChatChoice]
+    id: str
+    object: str = "chat.completion"
+    created: int
     model: str
-    tier: str
-    cost_usd: float
-    cached: bool
-    request_id: str
+    choices: list[ChatChoice]
+    usage: UsageInfo
 
 
 # --------------------------------------------------------------------- helpers
@@ -215,29 +220,66 @@ def _single_choice(content: str) -> list[ChatChoice]:
     ]
 
 
+def _openai_response(
+    request_id: str,
+    content: str,
+    model: str,
+    tokens_in: int,
+    tokens_out: int,
+    *,
+    tier: str,
+    cost_usd: float,
+    cached: bool,
+) -> JSONResponse:
+    """Build an OpenAI-compatible JSON response with TokenOps metadata in headers."""
+    body = ChatResponse(
+        id=f"chatcmpl-{request_id}",
+        created=int(time.time()),
+        model=model,
+        choices=_single_choice(content),
+        usage=UsageInfo(
+            prompt_tokens=tokens_in,
+            completion_tokens=tokens_out,
+            total_tokens=tokens_in + tokens_out,
+        ),
+    )
+    headers = {
+        "X-TokenOps-Request-ID": request_id,
+        "X-TokenOps-Tier": tier,
+        "X-TokenOps-Cost-USD": f"{cost_usd:.6f}",
+        "X-TokenOps-Cached": str(cached).lower(),
+    }
+    return JSONResponse(content=body.model_dump(), headers=headers)
+
+
 # ---------------------------------------------------------------------- routes
 @app.get("/health")
 async def health() -> dict[str, object]:
     return {"status": "ok", "rules_version": config.current_rules.id}
 
 
-@app.post("/v1/chat/completions", response_model=ChatResponse)
+@app.post("/v1/chat/completions")
 async def chat_completions(
     req: ChatRequest,
     x_tag: str | None = Header(default=None, alias="X-Tag"),
-) -> ChatResponse:
+    x_tokenops_route: str | None = Header(default=None, alias="X-TokenOps-Route"),
+    x_tokenops_cache: str | None = Header(default=None, alias="X-TokenOps-Cache"),
+) -> JSONResponse:
     request_id = str(uuid.uuid4())
     tag = req.tag or x_tag or "default"
     prompt = _prompt_key(req.messages)
     start = time.perf_counter()
 
+    # Routing mode: caller sends X-TokenOps-Route: auto to opt in to
+    # classifier-based routing. Default is passthrough (honor req.model).
+    use_classifier = (x_tokenops_route or "").lower() == "auto"
+    skip_cache = (x_tokenops_cache or "").lower() == "skip"
+
     try:
-        # 1. Cache lookup. Returns None on miss, timeout, or any failure —
-        #    never raises (Rule 5).
-        cached = await cache.lookup(prompt)
+        # 1. Cache lookup (skipped when caller sends X-TokenOps-Cache: skip).
+        cached = None if skip_cache else await cache.lookup(prompt)
         if cached is not None:
             latency_ms = (time.perf_counter() - start) * 1000.0
-            # TODO: pull tier from cache payload once cache.store accepts tier param
             _fire_and_forget(
                 ledger.log_request(
                     request_id=request_id,
@@ -266,18 +308,24 @@ async def chat_completions(
                     "latency_ms": latency_ms,
                 },
             )
-            return ChatResponse(
-                choices=_single_choice(cached["response"]),
-                model=cached["model"],
+            return _openai_response(
+                request_id,
+                cached["response"],
+                cached["model"],
+                tokens_in=0,
+                tokens_out=0,
                 tier="cache",
                 cost_usd=0.0,
                 cached=True,
-                request_id=request_id,
             )
 
-        # 2. Classify and pick a model.
-        tier = await classifier.classify(prompt)
-        model = router.select_model(tier)
+        # 2. Pick a model: classifier-based (opt-in) or passthrough (default).
+        if use_classifier or not req.model:
+            tier = await classifier.classify(prompt)
+            model = router.select_model(tier)
+        else:
+            model = req.model
+            tier = "passthrough"
 
         # 3. LLM call.
         callbacks = [_langfuse_handler] if _langfuse_handler else []
@@ -293,7 +341,7 @@ async def chat_completions(
                 },
             },
         )
-        content: str = result.content  # langchain returns str for plain chat
+        content: str = result.content
         usage = result.usage_metadata or {}
         tokens_in = int(usage.get("input_tokens", 0))
         tokens_out = int(usage.get("output_tokens", 0))
@@ -337,13 +385,15 @@ async def chat_completions(
             },
         )
 
-        return ChatResponse(
-            choices=_single_choice(content),
-            model=model,
+        return _openai_response(
+            request_id,
+            content,
+            model,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
             tier=tier,
             cost_usd=cost,
             cached=False,
-            request_id=request_id,
         )
 
     except HTTPException:
