@@ -15,6 +15,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SCHEMA = ROOT / "db" / "schema.sql"
 
+sys.path.insert(0, str(ROOT))
+
 
 def main() -> int:
     if not SCHEMA.is_file():

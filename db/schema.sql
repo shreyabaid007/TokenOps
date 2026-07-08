@@ -140,6 +140,18 @@ CREATE TABLE IF NOT EXISTS eval_runs (
 );
 
 
+-- v1 → v2 additive migrations. No-ops on fresh databases (the CREATE TABLE
+-- statements above already include these columns); they upgrade databases
+-- created before multi-tenancy and PII redaction existed.
+
+ALTER TABLE requests
+    ADD COLUMN IF NOT EXISTS tenant_id TEXT REFERENCES tenants(id);
+ALTER TABLE requests
+    ADD COLUMN IF NOT EXISTS redacted_entity_count INT DEFAULT 0;
+ALTER TABLE routing_rules
+    ADD COLUMN IF NOT EXISTS tenant_id TEXT REFERENCES tenants(id);
+
+
 -- Indexes — match the known query shapes from the steering files.
 
 -- proxy hot-reload: always reads latest row

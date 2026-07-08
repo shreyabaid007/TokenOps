@@ -618,30 +618,51 @@ def apply_node(state: OptimizerState) -> OptimizerState:
 
 # ------------------------------------------------------------------- assembly
 def _get_checkpointer():
-    """Create a PostgresSaver checkpointer for durable execution.
+    """Open a PostgresSaver on a dedicated connection for durable execution.
 
-    Returns None if the checkpointer tables don't exist yet (first run
-    before setup_checkpointer has been called).
+    PostgresSaver.from_conn_string() is a context manager, which is unusable
+    for our pause-at-approval-gate flow — the connection must outlive the
+    `with` block. Open the connection directly instead. Callers must release
+    it with _close_checkpointer() when done.
+
+    Returns None if Postgres is unreachable (agent then runs without
+    persistence and the approval gate auto-approves).
     """
     try:
         from langgraph.checkpoint.postgres import PostgresSaver
-        checkpointer = PostgresSaver.from_conn_string(settings.database_url)
-        return checkpointer
+        from psycopg import Connection
+        from psycopg.rows import dict_row
+
+        conn = Connection.connect(
+            settings.database_url,
+            autocommit=True,
+            prepare_threshold=0,
+            row_factory=dict_row,
+        )
+        return PostgresSaver(conn)
     except Exception as exc:
         logger.warning("checkpointer unavailable — running without persistence",
                        extra={"error": str(exc)})
         return None
 
 
+def _close_checkpointer(checkpointer) -> None:
+    """Release the dedicated connection opened by _get_checkpointer."""
+    if checkpointer is None:
+        return
+    try:
+        checkpointer.conn.close()
+    except Exception as exc:
+        logger.warning("checkpointer connection close failed",
+                       extra={"error": str(exc)})
+
+
 def setup_checkpointer() -> None:
     """Create the checkpointer's internal tables. Call once at deploy time."""
-    try:
-        from langgraph.checkpoint.postgres import PostgresSaver
-        checkpointer = PostgresSaver.from_conn_string(settings.database_url)
+    from langgraph.checkpoint.postgres import PostgresSaver
+    with PostgresSaver.from_conn_string(settings.database_url) as checkpointer:
         checkpointer.setup()
-        logger.info("checkpointer tables created")
-    except Exception as exc:
-        logger.warning("checkpointer setup failed", extra={"error": str(exc)})
+    logger.info("checkpointer tables created")
 
 
 def build_graph(checkpointer=None) -> CompiledStateGraph:
@@ -671,19 +692,22 @@ def run_optimizer(window_hours: int = _OBSERVE_WINDOW_HOURS_DEFAULT) -> dict[str
     run_id = str(uuid.uuid4())
     thread_id = str(uuid.uuid4())
     checkpointer = _get_checkpointer()
-    graph = build_graph(checkpointer=checkpointer)
+    try:
+        graph = build_graph(checkpointer=checkpointer)
 
-    initial: OptimizerState = OptimizerState(
-        run_id=run_id,
-        window_hours=window_hours,
-        stats={},
-        proposals=[],
-        validated_proposals=[],
-        reasoning="",
-    )
+        initial: OptimizerState = OptimizerState(
+            run_id=run_id,
+            window_hours=window_hours,
+            stats={},
+            proposals=[],
+            validated_proposals=[],
+            reasoning="",
+        )
 
-    config = {"configurable": {"thread_id": thread_id}}
-    final = graph.invoke(initial, config=config)
+        config = {"configurable": {"thread_id": thread_id}}
+        final = graph.invoke(initial, config=config)
+    finally:
+        _close_checkpointer(checkpointer)
 
     applied = final.get("applied_rules", {})
     summary = {
@@ -709,14 +733,17 @@ def resume_with_approval(
     if checkpointer is None:
         raise RuntimeError("cannot resume — checkpointer not available")
 
-    graph = build_graph(checkpointer=checkpointer)
-    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        graph = build_graph(checkpointer=checkpointer)
+        config = {"configurable": {"thread_id": thread_id}}
 
-    from langgraph.types import Command
-    final = graph.invoke(
-        Command(resume={"approved": approved, "reviewer": reviewer}),
-        config=config,
-    )
+        from langgraph.types import Command
+        final = graph.invoke(
+            Command(resume={"approved": approved, "reviewer": reviewer}),
+            config=config,
+        )
+    finally:
+        _close_checkpointer(checkpointer)
 
     applied = final.get("applied_rules", {})
     return {
@@ -737,21 +764,30 @@ def get_pending_approvals() -> list[dict[str, object]]:
     pending: list[dict[str, object]] = []
     try:
         graph = build_graph(checkpointer=checkpointer)
-        for state_snapshot in checkpointer.list({}):
-            if state_snapshot.next and "approval_gate" in state_snapshot.next:
-                thread_config = state_snapshot.config
-                thread_id = thread_config.get("configurable", {}).get("thread_id", "unknown")
-                channel_values = state_snapshot.values
+        # checkpointer.list yields raw CheckpointTuples (several per thread);
+        # collect distinct thread ids, then read each thread's latest state
+        # through the graph, which exposes .next and .values.
+        seen: set[str] = set()
+        for ckpt in checkpointer.list(None):
+            thread_id = ckpt.config.get("configurable", {}).get("thread_id")
+            if not thread_id or thread_id in seen:
+                continue
+            seen.add(thread_id)
+            snapshot = graph.get_state({"configurable": {"thread_id": thread_id}})
+            if snapshot.next and "approval_gate" in snapshot.next:
+                channel_values = snapshot.values
                 pending.append({
                     "thread_id": thread_id,
                     "run_id": channel_values.get("run_id"),
                     "validated_proposals": channel_values.get("validated_proposals", []),
                     "stats": channel_values.get("stats", {}),
                     "reasoning": channel_values.get("reasoning", ""),
-                    "created_at": str(state_snapshot.created_at) if hasattr(state_snapshot, "created_at") else None,
+                    "created_at": str(snapshot.created_at) if snapshot.created_at else None,
                 })
     except Exception as exc:
         logger.warning("failed to list pending approvals", extra={"error": str(exc)})
+    finally:
+        _close_checkpointer(checkpointer)
 
     return pending
 
@@ -764,15 +800,18 @@ def get_thread_history(thread_id: str) -> list[dict[str, object]]:
 
     history: list[dict[str, object]] = []
     try:
+        graph = build_graph(checkpointer=checkpointer)
         config = {"configurable": {"thread_id": thread_id}}
-        for state_snapshot in checkpointer.list(config):
+        for state_snapshot in graph.get_state_history(config):
             history.append({
                 "step": state_snapshot.metadata.get("step", 0) if state_snapshot.metadata else 0,
                 "next_nodes": list(state_snapshot.next) if state_snapshot.next else [],
                 "values": dict(state_snapshot.values),
-                "created_at": str(state_snapshot.created_at) if hasattr(state_snapshot, "created_at") else None,
+                "created_at": str(state_snapshot.created_at) if state_snapshot.created_at else None,
             })
     except Exception as exc:
         logger.warning("failed to get thread history", extra={"error": str(exc), "thread_id": thread_id})
+    finally:
+        _close_checkpointer(checkpointer)
 
     return history
