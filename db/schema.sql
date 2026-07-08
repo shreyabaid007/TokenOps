@@ -42,19 +42,12 @@ CREATE TABLE IF NOT EXISTS tenants (
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Seed tenants for demo. API keys are SHA-256 hashes of the plaintext keys
--- shown in .env.example. Guarded against re-insert.
---   genie-platform key: tok_genie_demo_key_2024
---   ee-internal key:    tok_ee_demo_key_2024
--- sha256('tok_genie_demo_key_2024')
-INSERT INTO tenants (id, name, api_key_hash, monthly_budget_usd)
-SELECT 'genie-platform', 'Genie Platform', '638df0c87b97063ac45fa967bb5921f2f03eafaf058b1e2ed740783b1560a6d9', 1000.00
-WHERE NOT EXISTS (SELECT 1 FROM tenants WHERE id = 'genie-platform');
-
--- sha256('tok_ee_demo_key_2024')
-INSERT INTO tenants (id, name, api_key_hash, monthly_budget_usd)
-SELECT 'ee-internal', 'EE Internal Tools', '6edb9a3a3d9e7ace66a85cffd301aa083ef56a5944ac94cab1ab927e7a0b3c45', 500.00
-WHERE NOT EXISTS (SELECT 1 FROM tenants WHERE id = 'ee-internal');
+-- No tenants are seeded here. API keys must never appear in the repo —
+-- create tenants (demo or real) with a freshly generated key via:
+--     python scripts/create_tenant.py --id genie-platform --name "Genie Platform" --budget 1000
+-- The script prints the plaintext key exactly once; only the SHA-256 hash
+-- is stored. Requests without a Bearer key resolve to the anonymous
+-- default tenant (proxy/auth.py), so the proxy works before any tenant exists.
 
 
 -- routing_rules — the agent's only output channel into the proxy.

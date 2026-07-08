@@ -70,7 +70,10 @@ tokenops/
 │       └── test_proxy_e2e.py
 │
 ├── scripts/
-│   └── seed_demo_traffic.py    # 200 synthetic requests for demo
+│   ├── seed_demo_traffic.py    # 200 synthetic requests for demo
+│   ├── create_tenant.py        # generate tenant + API key (hash-only storage)
+│   ├── setup_production_db.py  # schema + LangGraph checkpointer bootstrap
+│   └── deploy_modal.sh         # embedder → proxy → agent deploy sequence
 │
 ├── deploy/
 │   ├── prometheus.yml          # scrape config for the prod compose stack

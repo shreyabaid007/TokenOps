@@ -30,3 +30,6 @@ env/
 # Build / dist
 build/
 dist/
+
+# Generated test/eval artifacts
+eval-results.xml

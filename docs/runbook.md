@@ -117,8 +117,8 @@ spec that implements it.
 2. Restore latest dump from the backups volume / S3:
    `psql $DATABASE_URL < tokenops-YYYYMMDD.sql`.
 3. If restoring to an empty instance, apply schema first:
-   `psql $DATABASE_URL < db/schema.sql` (idempotent, includes seed rules
-   and demo tenants).
+   `psql $DATABASE_URL < db/schema.sql` (idempotent, includes seed rules;
+   tenants are recreated with `python scripts/create_tenant.py`).
 4. Restart the proxy so the lifespan re-bootstraps rules and the pool.
 5. RTO target: 1 hour. RPO: 24 hours (daily dumps).
 
@@ -153,23 +153,20 @@ Cross-check `tokenops_cost_usd_total` rate in Prometheus/Grafana.
 
 ### Rotating a tenant API key
 
-```sql
-UPDATE tenants SET api_key_hash = '<sha256-of-new-key>' WHERE id = '<tenant>';
+```bash
+python scripts/create_tenant.py --id <tenant> --name "<Display Name>" --rotate
 ```
 
-Then invalidate the proxy's auth cache: restart the proxy, or wait out the
-5-minute TTL (`proxy/auth.py` `CACHE_TTL_SEC`). Distribute the new key to
-the tenant out-of-band.
+The script prints the new key once; only the hash is stored. Then invalidate
+the proxy's auth cache: restart the proxy, or wait out the 5-minute TTL
+(`proxy/auth.py` `CACHE_TTL_SEC`). Distribute the new key out-of-band.
 
 ### Adding a new tenant
 
-```sql
-INSERT INTO tenants (id, name, api_key_hash, monthly_budget_usd)
-VALUES ('<kebab-id>', '<Display Name>', '<sha256-of-key>', 500.00);
+```bash
+python scripts/create_tenant.py --id <kebab-id> --name "<Display Name>" --budget 500
 ```
 
-Generate the key and hash locally:
-`python3 -c "import secrets,hashlib; k='tok_'+secrets.token_urlsafe(24); print(k, hashlib.sha256(k.encode()).hexdigest())"`.
 No proxy restart needed — the tenant resolves on first request.
 
 ### Emergency: disabling the agent
