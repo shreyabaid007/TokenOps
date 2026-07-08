@@ -16,13 +16,19 @@ Run with:
 
 import asyncio
 import json
+import sys
 import time
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import altair as alt
 import asyncpg
 import pandas as pd
 import streamlit as st
+
+# Streamlit puts the script's directory on sys.path, not the repo root —
+# make `agent` and `proxy` importable regardless of how the app is launched.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent.graph import get_pending_approvals, resume_with_approval, run_optimizer
 from proxy.config import settings
