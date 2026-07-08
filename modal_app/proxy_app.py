@@ -3,39 +3,27 @@
 Deploy:
     modal deploy modal_app/proxy_app.py
 
-Includes proxy + agent packages (agent endpoints import agent.graph).
+Includes proxy + agent packages (agent approval endpoints import agent.graph).
+The image installs the exact pins from requirements.txt plus the spaCy NER
+model Presidio needs.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import modal
 
-SPACY_MODEL = "en_core_web_sm"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
 SPACY_WHEEL = (
     "https://github.com/explosion/spacy-models/releases/download/"
-    f"{SPACY_MODEL}-3.7.1/{SPACY_MODEL}-3.7.1-py3-none-any.whl"
+    "en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl"
 )
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install(
-        "fastapi==0.111.0",
-        "uvicorn[standard]==0.29.0",
-        "httpx==0.27.0",
-        "psycopg[binary,pool]==3.1.18",
-        "qdrant-client==1.9.1",
-        "pydantic==2.7.1",
-        "pydantic-settings==2.2.1",
-        "python-dotenv==1.0.1",
-        "presidio-analyzer==2.2.354",
-        "presidio-anonymizer==2.2.354",
-        "spacy==3.7.5",
-        "prometheus-client==0.20.0",
-        "langgraph==0.2.28",
-        "langgraph-checkpoint-postgres==2.0.1",
-        "langchain-core==0.3.0",
-        "langchain-openai==0.2.0",
-    )
+    .pip_install_from_requirements(str(REPO_ROOT / "requirements.txt"))
     .pip_install(SPACY_WHEEL)
     .add_local_python_source("proxy", "agent")
 )

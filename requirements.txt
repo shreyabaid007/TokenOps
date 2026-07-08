@@ -22,3 +22,7 @@ presidio-analyzer==2.2.356
 presidio-anonymizer==2.2.356
 spacy==3.7.5
 prometheus-client==0.21.0
+
+# langgraph-checkpoint-postgres needs a working libpq; the binary extra
+# bundles it so slim containers and dev machines need no system package.
+psycopg[binary]==3.3.4

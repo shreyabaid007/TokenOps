@@ -102,6 +102,7 @@ langfuse==4.6.1
 presidio-analyzer==2.2.356
 presidio-anonymizer==2.2.356
 prometheus-client==0.21.0
+psycopg[binary]==3.3.4
 ```
 
 Do not add dependencies not in this list without updating it first.
