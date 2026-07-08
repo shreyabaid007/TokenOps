@@ -8,12 +8,12 @@ suggesting any architectural change.
 
 ## What this project is
 
-TokenOps is a **LLM cost intelligence proxy** — a FastAPI service that sits
-between application code and LLM providers (via OpenRouter). It caches
-semantically similar prompts, routes requests to the cheapest capable model,
-and tracks every cent by team and feature. A LangGraph optimizer agent runs
-in the background, autonomously tuning routing and cache rules without human
-intervention.
+TokenOps is an **LLM cost governance platform** — a FastAPI service that sits
+beside any LLM gateway, providing multi-tenant cost attribution, budget
+enforcement, PII redaction, semantic caching, intelligent routing, and an
+autonomous optimizer agent with human-in-the-loop approval. It reads
+telemetry, attributes cost per tenant, and runs a closed-loop governance
+cycle: observe → optimise → back-test → approve → apply → measure.
 
 Full context is in `.kiro/steering/`:
 - `product.md` — what and why
@@ -57,7 +57,11 @@ If you need to add I/O there, you're in the wrong module.
 
 **When in doubt, log it.**
 Use Python `logging`, not `print()`. Every proxy log line should include
-`request_id`, `tag`, `model`, `cached`, `latency_ms`.
+`request_id`, `tenant_id`, `tag`, `model`, `cached`, `latency_ms`.
+
+**PII never reaches the LLM or cache.**
+Redaction runs before cache lookup. The cache key uses the redacted prompt.
+Never log PII entities — only log entity counts.
 
 ---
 
@@ -67,7 +71,9 @@ Use Python `logging`, not `print()`. Every proxy log line should include
 - Define database tables in Python code — `db/schema.sql` is the only source
 - Call `os.environ` directly — always go through `proxy/config.py` Settings
 - Put agent code in `proxy/` or proxy logic in `agent/`
-- Use `stream=True` on LLM calls (not supported in v1)
+- Use `stream=True` on LLM calls (not supported in v2)
+- Store PII in cache or logs — always redact first
+- Skip the approval gate in the agent — all rule changes need human review
 - Hardcode any API key, URL, or threshold as a Python literal
 - Add `Any` type hints — be explicit
 

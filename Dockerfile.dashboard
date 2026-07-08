@@ -1,0 +1,41 @@
+# TokenOps Streamlit dashboard.
+#
+# Build:  docker build -f Dockerfile.dashboard -t tokenops-dashboard .
+# Run:    docker run -p 8501:8501 --env-file .env tokenops-dashboard
+
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt \
+    && pip install --no-cache-dir --prefix=/install \
+       "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl"
+
+FROM python:3.11-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system tokenops \
+    && useradd --system --gid tokenops --no-create-home tokenops
+
+WORKDIR /app
+
+COPY --from=builder /install /usr/local
+COPY proxy/ proxy/
+COPY agent/ agent/
+COPY dashboard/ dashboard/
+
+USER tokenops
+
+EXPOSE 8501
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://localhost:8501/_stcore/health || exit 1
+
+CMD ["streamlit", "run", "dashboard/app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]

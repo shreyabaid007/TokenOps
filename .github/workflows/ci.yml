@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt -r requirements-dev.txt
+          pip install ruff
+
+      - name: Lint (ruff)
+        run: ruff check proxy/ agent/ eval/ tests/
+
+      - name: Unit tests
+        run: pytest tests/ -v --junitxml=test-results.xml
+
+      - name: Eval CI gate
+        run: python -m eval.ci_gate --junit-out eval-results.xml
+
+      - name: Dependency vulnerability scan
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt || true  # advisory for now; flip to hard-fail once baseline is clean
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            test-results.xml
+            eval-results.xml
+
+  build-and-push:
+    # On merge to main: build images and push to registry (staging deploy).
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push proxy image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/proxy:staging
+            ghcr.io/${{ github.repository }}/proxy:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push agent image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.agent
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/agent:staging
+            ghcr.io/${{ github.repository }}/agent:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push dashboard image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.dashboard
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/dashboard:staging
+            ghcr.io/${{ github.repository }}/dashboard:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  promote-to-production:
+    # On release tag: retag the staging images as production.
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote staging images to production
+        run: |
+          for component in proxy agent dashboard; do
+            docker buildx imagetools create \
+              --tag ghcr.io/${{ github.repository }}/$component:production \
+              --tag ghcr.io/${{ github.repository }}/$component:${{ github.event.release.tag_name }} \
+              ghcr.io/${{ github.repository }}/$component:staging
+          done

@@ -1,0 +1,10 @@
+# Prometheus scrape config for the docker-compose.prod.yml stack.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: tokenops-proxy
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["proxy:8000"]

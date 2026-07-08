@@ -22,6 +22,13 @@ class _FakePoint:
         self.score = score
 
 
+class _FakeQueryResponse:
+    """Duck-typed stand-in for qdrant_client's QueryResponse."""
+
+    def __init__(self, points: list[_FakePoint]) -> None:
+        self.points = points
+
+
 def _rules(threshold: float) -> config.RoutingRules:
     return config.RoutingRules(
         id=1,
@@ -44,7 +51,9 @@ async def test_lookup_returns_payload_when_neighbour_above_threshold(
         "tokens_out": 20,
     }
     fake_qdrant = AsyncMock()
-    fake_qdrant.search = AsyncMock(return_value=[_FakePoint(payload, score=0.95)])
+    fake_qdrant.query_points = AsyncMock(
+        return_value=_FakeQueryResponse([_FakePoint(payload, score=0.95)])
+    )
 
     monkeypatch.setattr(cache, "_embed", AsyncMock(return_value=[0.1] * 384))
     monkeypatch.setattr(cache, "_qdrant", lambda: fake_qdrant)
@@ -54,7 +63,7 @@ async def test_lookup_returns_payload_when_neighbour_above_threshold(
     assert result == payload
     # The active threshold from config.current_rules must reach Qdrant —
     # otherwise the agent's hot-reloaded threshold would have no effect.
-    kwargs = fake_qdrant.search.call_args.kwargs
+    kwargs = fake_qdrant.query_points.call_args.kwargs
     assert kwargs["score_threshold"] == 0.90
     assert kwargs["collection_name"] == cache.COLLECTION_NAME
 
@@ -67,7 +76,7 @@ async def test_lookup_returns_none_when_no_neighbour_passes_threshold(
     monkeypatch.setattr(config, "current_rules", _rules(0.92))
 
     fake_qdrant = AsyncMock()
-    fake_qdrant.search = AsyncMock(return_value=[])
+    fake_qdrant.query_points = AsyncMock(return_value=_FakeQueryResponse([]))
 
     monkeypatch.setattr(cache, "_embed", AsyncMock(return_value=[0.1] * 384))
     monkeypatch.setattr(cache, "_qdrant", lambda: fake_qdrant)
@@ -93,7 +102,7 @@ async def test_lookup_returns_none_when_modal_times_out(
     monkeypatch.setattr(cache, "_embedder", lambda: fake_fn)
 
     fake_qdrant = AsyncMock()
-    fake_qdrant.search = AsyncMock(
+    fake_qdrant.query_points = AsyncMock(
         side_effect=AssertionError("qdrant must not be called when embed fails")
     )
     monkeypatch.setattr(cache, "_qdrant", lambda: fake_qdrant)
@@ -101,4 +110,4 @@ async def test_lookup_returns_none_when_modal_times_out(
     result = await cache.lookup("hello")
 
     assert result is None
-    fake_qdrant.search.assert_not_called()
+    fake_qdrant.query_points.assert_not_called()

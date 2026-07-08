@@ -1,0 +1,138 @@
+# TokenOps production-style compose stack.
+#
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# Proxy runs 2 replicas behind Traefik; agent and dashboard single replica;
+# Postgres and Qdrant with persistent volumes; Prometheus + Grafana for
+# observability. Environment comes from .env.prod (copy .env.example).
+
+name: tokenops-prod
+
+services:
+  traefik:
+    image: traefik:v3.1
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+    ports:
+      - "80:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
+  proxy:
+    build: .
+    env_file: .env.prod
+    deploy:
+      replicas: 2
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.proxy.rule=PathPrefix(`/`)
+      - traefik.http.services.proxy.loadbalancer.server.port=8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    restart: unless-stopped
+
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    env_file: .env.prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    env_file: .env.prod
+    ports:
+      - "8501:8501"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: tokenops
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env.prod}
+      POSTGRES_DB: tokenops
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tokenops"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Daily pg_dump into the backups volume; ship to S3 with a cron on the
+  # host or a sidecar with cloud credentials (kept out of this file).
+  postgres-backup:
+    image: postgres:16-alpine
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - >
+        while true; do
+        pg_dump "postgresql://tokenops:$${POSTGRES_PASSWORD}@postgres:5432/tokenops"
+        > /backups/tokenops-$$(date +%Y%m%d).sql
+        && find /backups -name '*.sql' -mtime +30 -delete;
+        sleep 86400;
+        done
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env.prod}
+    volumes:
+      - pgbackups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.9.0
+    volumes:
+      - qdrant-data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  pgbackups:
+  qdrant-data:
+  prometheus-data:
+  grafana-data:

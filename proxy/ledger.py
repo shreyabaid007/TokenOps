@@ -46,6 +46,27 @@ def _pool_or_raise() -> asyncpg.Pool:
     return _pool
 
 
+def pool_stats() -> dict[str, int | None]:
+    """Current pool sizing for /health. Safe before init (returns Nones)."""
+    if _pool is None:
+        return {"db_pool_size": None, "db_pool_free": None}
+    return {
+        "db_pool_size": _pool.get_size(),
+        "db_pool_free": _pool.get_idle_size(),
+    }
+
+
+async def ping() -> bool:
+    """Deep health probe: round-trip SELECT 1. Never raises."""
+    try:
+        async with _pool_or_raise().acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        return True
+    except Exception as exc:
+        logger.warning("postgres ping failed", extra={"error": str(exc)})
+        return False
+
+
 async def log_request(
     request_id: str,
     prompt: str,
@@ -58,6 +79,8 @@ async def log_request(
     counterfactual_cost_usd: float,
     cached: bool,
     latency_ms: float,
+    tenant_id: str | None = None,
+    redacted_entity_count: int = 0,
 ) -> None:
     """Insert one row into requests. Never raises out — a failed write is
     logged and discarded so a DB blip never bubbles into the response path.
@@ -72,20 +95,121 @@ async def log_request(
             await conn.execute(
                 """
                 INSERT INTO requests (
-                    request_id, prompt_hash, prompt_snip, tag, model, tier,
-                    tokens_in, tokens_out, cost_usd, counterfactual_cost_usd,
-                    cached, latency_ms
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                    request_id, tenant_id, prompt_hash, prompt_snip, tag,
+                    model, tier, tokens_in, tokens_out, cost_usd,
+                    counterfactual_cost_usd, cached, latency_ms,
+                    redacted_entity_count
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                 """,
-                request_id, prompt_hash, prompt_snip, tag, model, tier,
-                tokens_in, tokens_out, cost_usd, counterfactual_cost_usd,
-                cached, latency_ms,
+                request_id, tenant_id, prompt_hash, prompt_snip, tag,
+                model, tier, tokens_in, tokens_out, cost_usd,
+                counterfactual_cost_usd, cached, latency_ms,
+                redacted_entity_count,
             )
     except Exception as exc:
         logger.warning(
             "ledger insert failed",
             extra={"request_id": request_id, "error": str(exc)},
         )
+
+
+async def get_tenant_spend(tenant_id: str) -> float:
+    """Total spend for a tenant in the current calendar month."""
+    async with _pool_or_raise().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT COALESCE(SUM(cost_usd), 0) AS total_spend
+            FROM requests
+            WHERE tenant_id = $1
+              AND ts >= date_trunc('month', NOW())
+            """,
+            tenant_id,
+        )
+    return float(row["total_spend"]) if row else 0.0
+
+
+async def get_usage_stats(
+    tenant_id: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict:
+    """Aggregated usage stats for the /v1/usage endpoint."""
+    date_filter = ""
+    params: list = [tenant_id]
+    idx = 2
+
+    if start_date:
+        date_filter += f" AND ts >= ${idx}::timestamptz"
+        params.append(start_date)
+        idx += 1
+    if end_date:
+        date_filter += f" AND ts < ${idx}::timestamptz"
+        params.append(end_date)
+        idx += 1
+
+    async with _pool_or_raise().acquire() as conn:
+        summary = await conn.fetchrow(
+            f"""
+            SELECT
+                COALESCE(SUM(cost_usd), 0) AS total_spend,
+                COUNT(*) AS total_requests,
+                COALESCE(AVG(CASE WHEN cached THEN 1.0 ELSE 0.0 END), 0) AS cache_hit_rate,
+                COALESCE(SUM(counterfactual_cost_usd), 0) AS counterfactual_total
+            FROM requests
+            WHERE tenant_id = $1{date_filter}
+            """,
+            *params,
+        )
+
+        by_tag = await conn.fetch(
+            f"""
+            SELECT tag,
+                   COALESCE(SUM(cost_usd), 0) AS spend,
+                   COUNT(*) AS request_count
+            FROM requests
+            WHERE tenant_id = $1{date_filter}
+            GROUP BY tag
+            ORDER BY spend DESC
+            """,
+            *params,
+        )
+
+        by_model = await conn.fetch(
+            f"""
+            SELECT model,
+                   COALESCE(SUM(cost_usd), 0) AS spend,
+                   COUNT(*) AS request_count
+            FROM requests
+            WHERE tenant_id = $1{date_filter}
+            GROUP BY model
+            ORDER BY spend DESC
+            """,
+            *params,
+        )
+
+    total_spend = float(summary["total_spend"])
+    counterfactual = float(summary["counterfactual_total"])
+    savings_pct = (
+        (1.0 - total_spend / counterfactual) * 100.0
+        if counterfactual > 0
+        else 0.0
+    )
+
+    return {
+        "tenant_id": tenant_id,
+        "total_spend_usd": round(total_spend, 6),
+        "total_requests": int(summary["total_requests"]),
+        "cache_hit_rate": round(float(summary["cache_hit_rate"]), 4),
+        "savings_vs_opus_pct": round(savings_pct, 2),
+        "breakdown_by_tag": [
+            {"tag": r["tag"], "spend_usd": round(float(r["spend"]), 6), "requests": int(r["request_count"])}
+            for r in by_tag
+        ],
+        "breakdown_by_model": [
+            {"model": r["model"], "spend_usd": round(float(r["spend"]), 6), "requests": int(r["request_count"])}
+            for r in by_model
+        ],
+    }
 
 
 async def get_latest_rules() -> RoutingRules:

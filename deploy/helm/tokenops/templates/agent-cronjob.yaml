@@ -1,0 +1,37 @@
+# The optimizer agent runs as a CronJob: one bounded run per schedule tick
+# (scheduler.py's APScheduler loop is for local dev; in Kubernetes the
+# schedule lives here). concurrencyPolicy: Forbid prevents overlapping runs.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ .Release.Name }}-agent
+  labels:
+    {{- include "tokenops.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+spec:
+  schedule: {{ .Values.agent.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            {{- include "tokenops.labels" . | nindent 12 }}
+            app.kubernetes.io/component: agent
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+          containers:
+            - name: agent
+              image: "{{ .Values.image.registry }}/agent:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command: ["python", "-c", "from agent.graph import run_optimizer; run_optimizer()"]
+              {{- include "tokenops.envFrom" . | nindent 14 }}
+              resources:
+                {{- toYaml .Values.agent.resources | nindent 16 }}

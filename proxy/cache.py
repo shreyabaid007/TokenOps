@@ -15,13 +15,14 @@ so the optimizer agent can tighten or relax the cache without a restart.
 
 import asyncio
 import logging
+import time
 import uuid
 
 import modal
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
-from proxy import config
+from proxy import config, metrics
 from proxy.config import settings
 
 logger = logging.getLogger(__name__)
@@ -69,11 +70,13 @@ async def _embed(prompt: str) -> list[float] | None:
     Returns None on timeout or any other failure. Never raises — callers
     must handle None as 'cache unavailable, route normally'.
     """
+    start = time.perf_counter()
     try:
         result = await asyncio.wait_for(
             _embedder().remote.aio([prompt]),
             timeout=MODAL_TIMEOUT_SEC,
         )
+        metrics.EMBEDDING_LATENCY.observe(time.perf_counter() - start)
         return result[0]
     except asyncio.TimeoutError:
         logger.warning(
@@ -107,6 +110,23 @@ async def ensure_collection() -> None:
         "qdrant collection created",
         extra={"collection": COLLECTION_NAME, "dim": VECTOR_DIM},
     )
+
+
+async def ping() -> dict[str, object]:
+    """Deep health probe: is Qdrant reachable and how big is the cache?
+
+    Never raises — returns {"connected": False} on any failure so /health
+    can report degradation without becoming a 500 itself.
+    """
+    try:
+        count = await asyncio.wait_for(
+            _qdrant().count(collection_name=COLLECTION_NAME),
+            timeout=2.0,
+        )
+        return {"connected": True, "cache_collection_count": int(count.count)}
+    except Exception as exc:
+        logger.warning("qdrant ping failed", extra={"error": str(exc)})
+        return {"connected": False, "cache_collection_count": None}
 
 
 async def lookup(prompt: str) -> dict | None:

@@ -5,9 +5,12 @@
 --     psql $DATABASE_URL < db/schema.sql
 --
 -- Re-running this file is non-destructive: every CREATE uses IF NOT EXISTS,
--- and the seed INSERT is guarded so it runs only on an empty routing_rules.
+-- and the seed INSERTs are guarded so they run only on empty tables.
 --
 -- Table ownership (per .kiro/steering/structure.md):
+--
+--   tenants           written by: admin / seed
+--                     read by:    proxy/auth.py tenant resolution
 --
 --   routing_rules     written by: agent/graph.py apply_node
 --                     read by:    proxy/config.py reload loop
@@ -16,13 +19,42 @@
 --   requests          written by: proxy/ledger.py:log_request
 --                     read by:    agent/graph.py observe_node,
 --                                 agent/tools/quality_sample.py,
---                                 dashboard/app.py panels 1, 2, 4
+--                                 dashboard/app.py panels 1, 2, 4,
+--                                 proxy/budget.py spend queries
 --
 --   agent_decisions   written by: agent/graph.py apply_node
 --                     read by:    dashboard/app.py panel 3
 --
--- The proxy and agent share no in-process state. These three tables are the
+-- The proxy and agent share no in-process state. These tables are the
 -- entire interface between the data plane and the agent plane.
+
+
+-- tenants — multi-tenant identity and budget configuration.
+-- Each consuming team gets an API key; the proxy resolves it to a tenant_id
+-- on every request. Budgets are per calendar month.
+CREATE TABLE IF NOT EXISTS tenants (
+    id                TEXT PRIMARY KEY,
+    name              TEXT NOT NULL,
+    api_key_hash      TEXT NOT NULL UNIQUE,
+    monthly_budget_usd NUMERIC(10, 2) DEFAULT 500.00,
+    is_active         BOOLEAN NOT NULL DEFAULT TRUE,
+    redaction_config  JSONB DEFAULT '{"enabled": true, "entity_types": ["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "CREDIT_CARD"], "action": "redact"}'::jsonb,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Seed tenants for demo. API keys are SHA-256 hashes of the plaintext keys
+-- shown in .env.example. Guarded against re-insert.
+--   genie-platform key: tok_genie_demo_key_2024
+--   ee-internal key:    tok_ee_demo_key_2024
+-- sha256('tok_genie_demo_key_2024')
+INSERT INTO tenants (id, name, api_key_hash, monthly_budget_usd)
+SELECT 'genie-platform', 'Genie Platform', '638df0c87b97063ac45fa967bb5921f2f03eafaf058b1e2ed740783b1560a6d9', 1000.00
+WHERE NOT EXISTS (SELECT 1 FROM tenants WHERE id = 'genie-platform');
+
+-- sha256('tok_ee_demo_key_2024')
+INSERT INTO tenants (id, name, api_key_hash, monthly_budget_usd)
+SELECT 'ee-internal', 'EE Internal Tools', '6edb9a3a3d9e7ace66a85cffd301aa083ef56a5944ac94cab1ab927e7a0b3c45', 500.00
+WHERE NOT EXISTS (SELECT 1 FROM tenants WHERE id = 'ee-internal');
 
 
 -- routing_rules — the agent's only output channel into the proxy.
@@ -33,6 +65,7 @@ CREATE TABLE IF NOT EXISTS routing_rules (
     id              SERIAL PRIMARY KEY,
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_by      TEXT NOT NULL DEFAULT 'agent',
+    tenant_id       TEXT REFERENCES tenants(id),
     cache_threshold FLOAT NOT NULL DEFAULT 0.92,
     low_max_tokens  INT NOT NULL DEFAULT 300,
     high_min_tokens INT NOT NULL DEFAULT 800,
@@ -66,6 +99,7 @@ CREATE TABLE IF NOT EXISTS requests (
     id                       BIGSERIAL PRIMARY KEY,
     ts                       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     request_id               TEXT NOT NULL,
+    tenant_id                TEXT REFERENCES tenants(id),
     prompt_hash              TEXT,
     prompt_snip              TEXT,
     tag                      TEXT NOT NULL,
@@ -77,7 +111,8 @@ CREATE TABLE IF NOT EXISTS requests (
     counterfactual_cost_usd  NUMERIC(10, 6),
     cached                   BOOLEAN NOT NULL DEFAULT FALSE,
     latency_ms               FLOAT,
-    quality_score            FLOAT
+    quality_score            FLOAT,
+    redacted_entity_count    INT DEFAULT 0
 );
 
 
@@ -98,6 +133,20 @@ CREATE TABLE IF NOT EXISTS agent_decisions (
 );
 
 
+-- eval_runs — experiment result history for the quality evaluation pipeline.
+CREATE TABLE IF NOT EXISTS eval_runs (
+    id              SERIAL PRIMARY KEY,
+    run_id          TEXT NOT NULL UNIQUE,
+    dataset_version TEXT NOT NULL,
+    policy          TEXT NOT NULL,
+    avg_quality     FLOAT,
+    avg_cost        FLOAT,
+    total_requests  INT,
+    passed          BOOLEAN,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+
 -- Indexes — match the known query shapes from the steering files.
 
 -- proxy hot-reload: always reads latest row
@@ -115,3 +164,11 @@ CREATE INDEX IF NOT EXISTS idx_requests_quality_score_null
 -- dashboard panel 3: always reads by recency
 CREATE INDEX IF NOT EXISTS idx_agent_decisions_ts
     ON agent_decisions (ts DESC);
+
+-- budget.py: monthly spend per tenant
+CREATE INDEX IF NOT EXISTS idx_requests_tenant_ts
+    ON requests (tenant_id, ts DESC);
+
+-- auth.py: tenant lookup by API key hash
+CREATE INDEX IF NOT EXISTS idx_tenants_api_key_hash
+    ON tenants (api_key_hash);

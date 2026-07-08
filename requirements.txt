@@ -6,6 +6,7 @@ uvicorn[standard]==0.48.0
 langchain==0.3.30
 langchain-openai==0.3.0
 langgraph==0.2.76
+langgraph-checkpoint-postgres==2.0.7
 qdrant-client==1.18.0
 asyncpg==0.29.0
 pydantic-settings==2.3.0
@@ -15,3 +16,9 @@ apscheduler==3.10.4
 python-dotenv==1.0.1
 httpx==0.27.0
 langfuse==4.6.1
+
+# v2 additions — PII redaction (Spec 3), metrics (Spec 6)
+presidio-analyzer==2.2.356
+presidio-anonymizer==2.2.356
+spacy==3.7.5
+prometheus-client==0.21.0

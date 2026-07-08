@@ -1,0 +1,78 @@
+# Default values for the TokenOps chart.
+
+image:
+  registry: ghcr.io/example/tokenops
+  tag: production
+  pullPolicy: IfNotPresent
+
+proxy:
+  replicas: 2
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+agent:
+  # CronJob schedule — every 15 minutes, matching AGENT_RUN_INTERVAL_MINUTES.
+  schedule: "*/15 * * * *"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+dashboard:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+qdrant:
+  image: qdrant/qdrant:v1.9.0
+  storage: 10Gi
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+
+ingress:
+  enabled: true
+  className: nginx
+  proxyHost: tokenops.example.com
+  dashboardHost: tokenops-dashboard.example.com
+
+# Non-secret configuration → ConfigMap.
+config:
+  OPENROUTER_BASE_URL: https://openrouter.ai/api/v1
+  QDRANT_URL: http://tokenops-qdrant:6333
+  MODAL_EMBEDDER_APP: tokenops-embedder
+  AGENT_RUN_INTERVAL_MINUTES: "15"
+  RULES_RELOAD_INTERVAL_SEC: "60"
+  LANGFUSE_HOST: https://us.cloud.langfuse.com
+
+# Secrets are NOT set here. Create the Secret out-of-band:
+#   kubectl create secret generic tokenops-secrets \
+#     --from-literal=OPENROUTER_API_KEY=... \
+#     --from-literal=DATABASE_URL=... \
+#     --from-literal=QDRANT_API_KEY=... \
+#     --from-literal=LANGFUSE_PUBLIC_KEY=... \
+#     --from-literal=LANGFUSE_SECRET_KEY=... \
+#     --from-literal=AGENT_ADMIN_KEY=...
+secretName: tokenops-secrets

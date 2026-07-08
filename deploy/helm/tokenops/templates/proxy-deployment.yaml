@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-proxy
+  labels:
+    {{- include "tokenops.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+spec:
+  {{- if not .Values.proxy.hpa.enabled }}
+  replicas: {{ .Values.proxy.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tokenops
+      app.kubernetes.io/component: proxy
+  template:
+    metadata:
+      labels:
+        {{- include "tokenops.labels" . | nindent 8 }}
+        app.kubernetes.io/component: proxy
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: /metrics
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: proxy
+          image: "{{ .Values.image.registry }}/proxy:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 8000
+              name: http
+          {{- include "tokenops.envFrom" . | nindent 10 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health?deep=true
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.proxy.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-proxy
+  labels:
+    {{- include "tokenops.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: tokenops
+    app.kubernetes.io/component: proxy
+  ports:
+    - port: 80
+      targetPort: http
+      name: http
+{{- if .Values.proxy.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ .Release.Name }}-proxy
+  labels:
+    {{- include "tokenops.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ .Release.Name }}-proxy
+  minReplicas: {{ .Values.proxy.hpa.minReplicas }}
+  maxReplicas: {{ .Values.proxy.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.proxy.hpa.targetCPUUtilizationPercentage }}
+{{- end }}

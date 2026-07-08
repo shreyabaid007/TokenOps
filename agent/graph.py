@@ -1,4 +1,9 @@
-"""LangGraph optimizer agent — observe → analyse → validate → apply.
+"""LangGraph optimizer agent v2 — observe → analyse → validate → [interrupt] → apply.
+
+Upgrades from v1:
+  - PostgresSaver checkpointer: agent state survives process restarts mid-run.
+  - interrupt() before apply: the agent proposes, a human approves.
+  - InMemoryStore: accumulates historical proposal outcomes across threads.
 
 Runs every AGENT_RUN_INTERVAL_MINUTES via agent.scheduler. Communicates
 with the proxy exclusively through the routing_rules and agent_decisions
@@ -6,14 +11,10 @@ Postgres tables — never shares in-process state with the data plane.
 
 Safety bounds are hard-coded constants in this module. They cannot be
 overridden by the LLM analyser, by tool proposals, or by the agent's own
-state — validate_node enforces them every run. Per tech.md, the agent is
-allowed to retune within these bounds but never outside.
+state — validate_node enforces them every run.
 
 All node functions are sync per CLAUDE.md. DB I/O bridges to asyncpg via
-asyncio.run; LLM calls use sync chain.invoke. The cost of asyncio.run
-per query is negligible at this run frequency (every 15 minutes).
-Switch to a persistent async context per run if query count per run
-exceeds 50.
+asyncio.run; LLM calls use sync chain.invoke.
 """
 
 import asyncio
@@ -26,8 +27,8 @@ import asyncpg
 from langchain_openai import ChatOpenAI
 from langfuse.langchain import CallbackHandler as LangfuseCallbackHandler
 from langgraph.graph import END, StateGraph
-# LangGraph 0.2.x — update import path if upgrading
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import interrupt
 from pydantic import BaseModel
 
 from agent.tools import cache_tune, quality_sample, route_optimize
@@ -37,10 +38,6 @@ logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------- safety bounds
-# These are the hard limits the agent is allowed to operate within. Values
-# pulled from tech.md / structure.md. Treat as constants — never read from
-# config, never mutate. validate_node rejects any proposal that exits the bound.
-
 CACHE_THRESHOLD_RANGE: tuple[float, float] = (0.85, 0.97)
 LOW_MAX_TOKENS_RANGE: tuple[int, int] = (200, 500)
 HIGH_MIN_TOKENS_RANGE: tuple[int, int] = (600, 1200)
@@ -60,6 +57,7 @@ class OptimizerState(TypedDict, total=False):
     validated_proposals: list[dict[str, object]]
     reasoning: str
     applied_rules: dict[str, object]
+    approval: dict[str, object]
 
 
 # ----------------------------------------------------- analyser structured out
@@ -89,11 +87,6 @@ def _get_analysis_chain():
 
 
 def _get_langfuse() -> LangfuseCallbackHandler | None:
-    """Lazy Langfuse handler. Returns None if creds are absent.
-
-    The agent runs as a Modal scheduled function, so there's no FastAPI
-    lifespan to hook — initialise on first use instead. The env-var write
-    here is the sanctioned counterpart to the proxy's lifespan init."""
     global _langfuse_handler
     if _langfuse_handler is not None:
         return _langfuse_handler
@@ -109,12 +102,6 @@ def _get_langfuse() -> LangfuseCallbackHandler | None:
 
 # ------------------------------------------------------------- db helpers (async)
 async def _fetch_stats_async(window_hours: int) -> dict[str, object]:
-    """Aggregate the recent window of requests for the agent to reason about.
-
-    Excludes cache hits (tier='cache') from per-tier metrics — they don't
-    represent a routing decision the agent can act on. cache_hit_rate is
-    computed across all rows including cache hits.
-    """
     conn = await asyncpg.connect(settings.database_url)
     try:
         row = await conn.fetchrow(
@@ -182,8 +169,6 @@ async def _fetch_stats_async(window_hours: int) -> dict[str, object]:
 
 
 async def _fetch_backtest_rows_async() -> list[dict[str, object]]:
-    """Pull the last N requests with their scored quality and prompt snip
-    for the back-test in validate_node. Skips cache hits."""
     conn = await asyncpg.connect(settings.database_url)
     try:
         rows = await conn.fetch(
@@ -377,14 +362,46 @@ def validate_node(state: OptimizerState) -> OptimizerState:
     )
 
 
+def approval_gate_node(state: OptimizerState) -> OptimizerState:
+    """Interrupt execution to await human approval.
+
+    The graph pauses here. A human reviews the validated proposals and
+    resumes with Command(resume={"approved": True/False, "reviewer": "..."}).
+    If no rule-changing proposals passed validation, skip the gate.
+    """
+    validated = state.get("validated_proposals", [])
+    has_rule_changes = any(
+        p.get("action") != "no_change" and p.get("tool") in ("cache_tune", "route_optimize")
+        for p in validated
+    )
+
+    if not has_rule_changes:
+        logger.info("no rule-changing proposals — skipping approval gate",
+                     extra={"run_id": state.get("run_id")})
+        return OptimizerState(approval={"approved": True, "reviewer": "auto", "reason": "no rule changes"})
+
+    approval = interrupt({
+        "type": "approval_required",
+        "run_id": state.get("run_id"),
+        "validated_proposals": validated,
+        "message": "Review and approve/reject the optimizer proposals.",
+    })
+
+    logger.info(
+        "approval received",
+        extra={
+            "run_id": state.get("run_id"),
+            "approved": approval.get("approved"),
+            "reviewer": approval.get("reviewer"),
+        },
+    )
+    return OptimizerState(approval=approval)
+
+
 def _validate_cache_proposal(
     proposal: dict[str, object],
     backtest_rows: list[dict[str, object]],
 ) -> dict[str, object]:
-    """Hard bound on CACHE_THRESHOLD_RANGE, plus a data-driven sanity check:
-    if cached responses have systematically lower quality than uncached ones
-    and the proposal lowers the threshold (which would produce more hits),
-    reject."""
     proposed = float(proposal["proposed_threshold"])
     lo, hi = CACHE_THRESHOLD_RANGE
     if not (lo <= proposed <= hi):
@@ -425,9 +442,6 @@ def _validate_route_proposal(
     proposal: dict[str, object],
     backtest_rows: list[dict[str, object]],
 ) -> dict[str, object]:
-    """Range check both bands; then back-test by projecting how each
-    historical request would re-tier under the new bands and what the
-    projected average quality would be."""
     new_low = int(proposal["proposed_low_max"])
     new_high = int(proposal["proposed_high_min"])
 
@@ -452,9 +466,6 @@ def _validate_route_proposal(
     if proposal["action"] == "no_change":
         return {"valid": True, "reason": "no-op proposal"}
 
-    # Back-test: project tier reassignment for each historical request and
-    # compute projected avg quality, assuming each request retiered into the
-    # new tier inherits that tier's historical average quality.
     scored = [r for r in backtest_rows if r["quality_score"] is not None]
     if not scored:
         return {
@@ -522,6 +533,10 @@ def apply_node(state: OptimizerState) -> OptimizerState:
     validated = state.get("validated_proposals", [])
     stats = state.get("stats", {})
     reasoning = state.get("reasoning", "")
+    approval = state.get("approval", {})
+
+    approved = approval.get("approved", False)
+    reviewer = approval.get("reviewer", "unknown")
 
     current = dict(stats.get("current_rules", {}))
     new_rules = {
@@ -530,40 +545,43 @@ def apply_node(state: OptimizerState) -> OptimizerState:
         "high_min_tokens": int(current.get("high_min_tokens", 40)),
     }
 
-    # Fold validated, non-no_change proposals into the new rule set.
     rules_changed = False
-    for proposal in validated:
-        if proposal["action"] == "no_change":
-            continue
-        if proposal["tool"] == "cache_tune":
-            new_rules["cache_threshold"] = float(proposal["proposed_threshold"])
-            rules_changed = True
-        elif proposal["tool"] == "route_optimize":
-            new_rules["low_max_tokens"] = int(proposal["proposed_low_max"])
-            new_rules["high_min_tokens"] = int(proposal["proposed_high_min"])
-            rules_changed = True
-        # quality_sample is observational — never changes rules.
+    if approved:
+        for proposal in validated:
+            if proposal["action"] == "no_change":
+                continue
+            if proposal["tool"] == "cache_tune":
+                new_rules["cache_threshold"] = float(proposal["proposed_threshold"])
+                rules_changed = True
+            elif proposal["tool"] == "route_optimize":
+                new_rules["low_max_tokens"] = int(proposal["proposed_low_max"])
+                new_rules["high_min_tokens"] = int(proposal["proposed_high_min"])
+                rules_changed = True
 
     new_rules_id: int | None = None
     if rules_changed:
         new_rules_id = asyncio.run(
             _insert_routing_rules_async(
                 new_rules,
-                notes=f"agent run {run_id}",
+                notes=f"agent run {run_id} — approved by {reviewer}",
             )
         )
 
-    # Audit every proposal regardless of outcome.
     observation_json = json.dumps(stats, default=str)
     for proposal in proposals:
         verdict = proposal.get("validation", {})
         was_validated = bool(verdict.get("valid", False))
         was_applied = (
-            was_validated
+            approved
+            and was_validated
             and proposal["action"] != "no_change"
             and proposal["tool"] in ("cache_tune", "route_optimize")
             and rules_changed
         )
+        decision_reasoning = reasoning
+        if not approved:
+            decision_reasoning = f"Rejected by {reviewer}: {approval.get('reason', 'no reason given')}"
+
         asyncio.run(
             _insert_agent_decision_async(
                 run_id=run_id,
@@ -572,7 +590,7 @@ def apply_node(state: OptimizerState) -> OptimizerState:
                 proposal=json.dumps(proposal, default=str),
                 validated=was_validated,
                 applied=was_applied,
-                reasoning=reasoning,
+                reasoning=decision_reasoning,
             )
         )
 
@@ -580,6 +598,8 @@ def apply_node(state: OptimizerState) -> OptimizerState:
         "apply complete",
         extra={
             "run_id": run_id,
+            "approved": approved,
+            "reviewer": reviewer,
             "rules_changed": rules_changed,
             "new_rules_id": new_rules_id,
             "validated_count": len(validated),
@@ -590,30 +610,69 @@ def apply_node(state: OptimizerState) -> OptimizerState:
             "rules_changed": rules_changed,
             "new_rules_id": new_rules_id,
             "rules": new_rules,
+            "approved": approved,
+            "reviewer": reviewer,
         },
     )
 
 
 # ------------------------------------------------------------------- assembly
-def build_graph() -> CompiledStateGraph:
-    """Compile the four-node optimizer pipeline."""
+def _get_checkpointer():
+    """Create a PostgresSaver checkpointer for durable execution.
+
+    Returns None if the checkpointer tables don't exist yet (first run
+    before setup_checkpointer has been called).
+    """
+    try:
+        from langgraph.checkpoint.postgres import PostgresSaver
+        checkpointer = PostgresSaver.from_conn_string(settings.database_url)
+        return checkpointer
+    except Exception as exc:
+        logger.warning("checkpointer unavailable — running without persistence",
+                       extra={"error": str(exc)})
+        return None
+
+
+def setup_checkpointer() -> None:
+    """Create the checkpointer's internal tables. Call once at deploy time."""
+    try:
+        from langgraph.checkpoint.postgres import PostgresSaver
+        checkpointer = PostgresSaver.from_conn_string(settings.database_url)
+        checkpointer.setup()
+        logger.info("checkpointer tables created")
+    except Exception as exc:
+        logger.warning("checkpointer setup failed", extra={"error": str(exc)})
+
+
+def build_graph(checkpointer=None) -> CompiledStateGraph:
+    """Compile the five-node optimizer pipeline with approval gate."""
     graph = StateGraph(OptimizerState)
     graph.add_node("observe", observe_node)
     graph.add_node("analyse", analyse_node)
     graph.add_node("validate", validate_node)
+    graph.add_node("approval_gate", approval_gate_node)
     graph.add_node("apply", apply_node)
     graph.set_entry_point("observe")
     graph.add_edge("observe", "analyse")
     graph.add_edge("analyse", "validate")
-    graph.add_edge("validate", "apply")
+    graph.add_edge("validate", "approval_gate")
+    graph.add_edge("approval_gate", "apply")
     graph.add_edge("apply", END)
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
 
 
 def run_optimizer(window_hours: int = _OBSERVE_WINDOW_HOURS_DEFAULT) -> dict[str, object]:
-    """Single end-to-end agent run. Returns a summary suitable for logging."""
+    """Single end-to-end agent run. Returns a summary suitable for logging.
+
+    With checkpointing enabled, the graph pauses at approval_gate and returns
+    a partial result. The run is completed when POST /v1/agent/approve resumes
+    the thread. Without checkpointing, the approval gate auto-approves.
+    """
     run_id = str(uuid.uuid4())
-    graph = build_graph()
+    thread_id = str(uuid.uuid4())
+    checkpointer = _get_checkpointer()
+    graph = build_graph(checkpointer=checkpointer)
+
     initial: OptimizerState = OptimizerState(
         run_id=run_id,
         window_hours=window_hours,
@@ -622,15 +681,98 @@ def run_optimizer(window_hours: int = _OBSERVE_WINDOW_HOURS_DEFAULT) -> dict[str
         validated_proposals=[],
         reasoning="",
     )
-    final = graph.invoke(initial)
+
+    config = {"configurable": {"thread_id": thread_id}}
+    final = graph.invoke(initial, config=config)
 
     applied = final.get("applied_rules", {})
     summary = {
         "run_id": run_id,
+        "thread_id": thread_id,
         "proposals_total": len(final.get("proposals", [])),
         "proposals_validated": len(final.get("validated_proposals", [])),
         "rules_changed": bool(applied.get("rules_changed", False)),
         "new_rules_id": applied.get("new_rules_id"),
+        "paused_for_approval": "approval" not in final,
     }
     logger.info("optimizer run complete", extra=summary)
     return summary
+
+
+def resume_with_approval(
+    thread_id: str,
+    approved: bool,
+    reviewer: str,
+) -> dict[str, object]:
+    """Resume a paused graph thread with human approval decision."""
+    checkpointer = _get_checkpointer()
+    if checkpointer is None:
+        raise RuntimeError("cannot resume — checkpointer not available")
+
+    graph = build_graph(checkpointer=checkpointer)
+    config = {"configurable": {"thread_id": thread_id}}
+
+    from langgraph.types import Command
+    final = graph.invoke(
+        Command(resume={"approved": approved, "reviewer": reviewer}),
+        config=config,
+    )
+
+    applied = final.get("applied_rules", {})
+    return {
+        "thread_id": thread_id,
+        "approved": approved,
+        "reviewer": reviewer,
+        "rules_changed": bool(applied.get("rules_changed", False)),
+        "new_rules_id": applied.get("new_rules_id"),
+    }
+
+
+def get_pending_approvals() -> list[dict[str, object]]:
+    """List all graph threads paused at the approval gate."""
+    checkpointer = _get_checkpointer()
+    if checkpointer is None:
+        return []
+
+    pending: list[dict[str, object]] = []
+    try:
+        graph = build_graph(checkpointer=checkpointer)
+        for state_snapshot in checkpointer.list({}):
+            if state_snapshot.next and "approval_gate" in state_snapshot.next:
+                thread_config = state_snapshot.config
+                thread_id = thread_config.get("configurable", {}).get("thread_id", "unknown")
+                channel_values = state_snapshot.values
+                pending.append({
+                    "thread_id": thread_id,
+                    "run_id": channel_values.get("run_id"),
+                    "validated_proposals": channel_values.get("validated_proposals", []),
+                    "stats": channel_values.get("stats", {}),
+                    "reasoning": channel_values.get("reasoning", ""),
+                    "created_at": str(state_snapshot.created_at) if hasattr(state_snapshot, "created_at") else None,
+                })
+    except Exception as exc:
+        logger.warning("failed to list pending approvals", extra={"error": str(exc)})
+
+    return pending
+
+
+def get_thread_history(thread_id: str) -> list[dict[str, object]]:
+    """Return the state at each node for a given thread."""
+    checkpointer = _get_checkpointer()
+    if checkpointer is None:
+        return []
+
+    history: list[dict[str, object]] = []
+    try:
+        config = {"configurable": {"thread_id": thread_id}}
+        for state_snapshot in checkpointer.list(config):
+            history.append({
+                "step": state_snapshot.metadata.get("step", 0) if state_snapshot.metadata else 0,
+                "next_nodes": list(state_snapshot.next) if state_snapshot.next else [],
+                "values": dict(state_snapshot.values),
+                "created_at": str(state_snapshot.created_at) if hasattr(state_snapshot, "created_at") else None,
+            })
+    except Exception as exc:
+        logger.warning("failed to get thread history", extra={"error": str(exc), "thread_id": thread_id})
+
+    return history

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: tokenops
+description: TokenOps — LLM cost governance platform (proxy, optimizer agent, dashboard)
+type: application
+version: 0.1.0
+appVersion: "2.0.0"

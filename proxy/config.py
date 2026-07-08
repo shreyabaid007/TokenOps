@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     langfuse_public_key: str | None = None
     langfuse_secret_key: str | None = None
     langfuse_host: str = "https://us.cloud.langfuse.com"
+    # When set, /v1/agent/* requires Authorization: Bearer <key> or
+    # X-TokenOps-Admin-Key. Leave unset for local dev only.
+    agent_admin_key: str | None = None
 
 
 settings = Settings()

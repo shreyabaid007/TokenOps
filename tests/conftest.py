@@ -13,15 +13,17 @@ The fixture handles per-test resets if a test mutates the env.
 
 import os
 
-os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+os.environ.setdefault("OPENROUTER_API_KEY", "test-key")
 os.environ.setdefault("DATABASE_URL", "postgresql://localhost/test")
 os.environ.setdefault("MODAL_EMBEDDER_APP", "test-embedder")
+os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
 
 import pytest
 
 
 @pytest.fixture(autouse=True)
 def mock_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setenv("DATABASE_URL", "postgresql://localhost/test")
     monkeypatch.setenv("MODAL_EMBEDDER_APP", "test-embedder")
+    monkeypatch.setenv("QDRANT_URL", "http://localhost:6333")

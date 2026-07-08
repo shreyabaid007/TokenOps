@@ -1,0 +1,49 @@
+# Plane separation enforced at the network layer:
+#   proxy     → Postgres (external), Qdrant, OpenRouter (egress 443)
+#   agent     → Postgres only (plus OpenRouter for the analyser LLM)
+#   dashboard → Postgres only
+# Postgres is assumed external (RDS/Neon), reached via egress; Qdrant is
+# in-cluster and locked to the proxy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-qdrant-ingress
+  labels:
+    {{- include "tokenops.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: tokenops
+      app.kubernetes.io/component: qdrant
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: tokenops
+              app.kubernetes.io/component: proxy
+      ports:
+        - port: 6333
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-dashboard-egress
+  labels:
+    {{- include "tokenops.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: tokenops
+      app.kubernetes.io/component: dashboard
+  policyTypes: [Egress]
+  egress:
+    # DNS
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Postgres (external)
+    - ports:
+        - port: 5432

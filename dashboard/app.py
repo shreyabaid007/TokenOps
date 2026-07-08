@@ -1,15 +1,21 @@
-"""TokenOps dashboard — four-panel Streamlit view over the proxy ledger.
+"""TokenOps dashboard — multi-panel Streamlit view over the proxy ledger.
+
+Panels:
+  1. Overview metrics (spend, savings, cache hit rate, tier breakdown)
+  2. Cost by tag & model
+  3. Agent decisions + pending approval actions
+  4. Budget utilization per tenant
+  5. Recent request feed
 
 Reads directly from Postgres (the same tables the proxy writes). No API
-layer; the proxy and agent never see this process. Each refresh re-issues
-the panel queries — at the demo refresh interval (10s) and ~4 panels per
-tick the per-query connection overhead is well under a second.
+layer; the proxy and agent never see this process.
 
 Run with:
     streamlit run dashboard/app.py
 """
 
 import asyncio
+import json
 import time
 from datetime import date, datetime, timedelta, timezone
 
@@ -18,18 +24,15 @@ import asyncpg
 import pandas as pd
 import streamlit as st
 
-from agent.graph import run_optimizer
+from agent.graph import get_pending_approvals, resume_with_approval, run_optimizer
 from proxy.config import settings
 
 
-# Model colour palette — green = cheap (Haiku), amber = mid (Sonnet),
-# red = expensive (Opus).
 COLOR_HAIKU  = "#22c55e"
 COLOR_SONNET = "#f59e0b"
 COLOR_OPUS   = "#ef4444"
 COLOR_CACHE  = "#6366f1"
 
-# Keys match the OpenRouter model strings stored in the DB.
 MODEL_COLORS: dict[str, str] = {
     "anthropic/claude-haiku-4-5":  COLOR_HAIKU,
     "anthropic/claude-sonnet-4-5": COLOR_SONNET,
@@ -56,12 +59,10 @@ TIER_DISPLAY: dict[str, str] = {
 
 
 def _short_model(name: str) -> str:
-    """Strip the 'anthropic/' vendor prefix for compact display."""
     return name.replace("anthropic/", "")
 
 
 def _tier_display(tier: str) -> str:
-    """Map tier code to display name."""
     return TIER_DISPLAY.get(tier, tier)
 
 
@@ -77,7 +78,6 @@ async def _fetch_async(query: str, *args: object) -> list[dict[str, object]]:
 
 @st.cache_data(ttl=10, show_spinner=False)
 def fetch(query: str, *args: object) -> pd.DataFrame:
-    """Sync wrapper for async DB queries, cached for 10 s."""
     return pd.DataFrame(asyncio.run(_fetch_async(query, *args)))
 
 
@@ -94,7 +94,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("TokenOps - LLM Cost Intelligence")
+st.title("TokenOps — LLM Cost Governance")
 st.divider()
 
 
@@ -122,8 +122,8 @@ with st.sidebar:
         start_date = end_date = today
 
     st.divider()
-    if st.button("⚡ Run optimizer now", type="primary", use_container_width=True):
-        with st.spinner("Running optimizer (10–30 s)…"):
+    if st.button("Run optimizer now", type="primary", use_container_width=True):
+        with st.spinner("Running optimizer (10-30 s)..."):
             st.session_state["last_run_summary"] = run_optimizer()
 
     if "last_run_summary" in st.session_state:
@@ -317,48 +317,129 @@ st.divider()
 # =================================================== Panel 3 — agent decisions
 st.subheader("Agent decisions")
 
-panel3_df = fetch(
-    """
-    SELECT ts, tool_used, proposal, validated, applied, reasoning
-    FROM agent_decisions
-    ORDER BY ts DESC
-    LIMIT 20
-    """
-)
+col_decisions, col_approvals = st.columns([3, 2], gap="large")
 
-if panel3_df.empty:
-    st.info("No agent runs yet. Use **Run optimizer now** in the sidebar.")
-else:
-    display3 = panel3_df.copy()
-    display3["proposal"]  = display3["proposal"].fillna("").str.slice(0, 100)
-    display3["reasoning"] = display3["reasoning"].fillna("").str.slice(0, 100)
-    display3["validated"] = display3["validated"].map({True: "✓", False: "✗", None: "—"})
-    display3["applied"]   = display3["applied"].map({True: "✓", False: "✗", None: "—"})
-
-    st.dataframe(
-        display3,
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "ts":        st.column_config.DatetimeColumn("Time", format="HH:mm:ss"),
-            "tool_used": st.column_config.TextColumn("Tool", width="small"),
-            "proposal":  st.column_config.TextColumn("Proposal", width="large"),
-            "validated": st.column_config.TextColumn("Valid", width="small"),
-            "applied":   st.column_config.TextColumn("Applied", width="small"),
-            "reasoning": st.column_config.TextColumn("Reasoning", width="large"),
-        },
+with col_decisions:
+    panel3_df = fetch(
+        """
+        SELECT ts, tool_used, proposal, validated, applied, reasoning
+        FROM agent_decisions
+        ORDER BY ts DESC
+        LIMIT 20
+        """
     )
+
+    if panel3_df.empty:
+        st.info("No agent runs yet. Use **Run optimizer now** in the sidebar.")
+    else:
+        display3 = panel3_df.copy()
+        display3["proposal"]  = display3["proposal"].fillna("").str.slice(0, 100)
+        display3["reasoning"] = display3["reasoning"].fillna("").str.slice(0, 100)
+        display3["validated"] = display3["validated"].map({True: "pass", False: "fail", None: "-"})
+        display3["applied"]   = display3["applied"].map({True: "pass", False: "fail", None: "-"})
+
+        st.dataframe(
+            display3,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "ts":        st.column_config.DatetimeColumn("Time", format="HH:mm:ss"),
+                "tool_used": st.column_config.TextColumn("Tool", width="small"),
+                "proposal":  st.column_config.TextColumn("Proposal", width="large"),
+                "validated": st.column_config.TextColumn("Valid", width="small"),
+                "applied":   st.column_config.TextColumn("Applied", width="small"),
+                "reasoning": st.column_config.TextColumn("Reasoning", width="large"),
+            },
+        )
+
+with col_approvals:
+    st.markdown("**Pending approvals**")
+    try:
+        pending = get_pending_approvals()
+    except Exception:
+        pending = []
+
+    if not pending:
+        st.info("No proposals awaiting approval.")
+    else:
+        for i, item in enumerate(pending):
+            thread_id = item.get("thread_id", "")
+            run_id = item.get("run_id", "")
+            proposals = item.get("validated_proposals", [])
+
+            with st.expander(f"Run {run_id[:8]}... ({len(proposals)} proposals)", expanded=True):
+                for p in proposals:
+                    tool = p.get("tool", "?")
+                    action = p.get("action", "?")
+                    validation = p.get("validation", {})
+                    st.markdown(f"**{tool}**: {action}")
+                    st.caption(validation.get("reason", ""))
+
+                col_approve, col_reject = st.columns(2)
+                with col_approve:
+                    if st.button("Approve", key=f"approve_{i}", type="primary", use_container_width=True):
+                        with st.spinner("Applying..."):
+                            result = resume_with_approval(thread_id, True, "dashboard_user")
+                            st.success(f"Applied! Rules ID: {result.get('new_rules_id')}")
+                            st.rerun()
+                with col_reject:
+                    if st.button("Reject", key=f"reject_{i}", use_container_width=True):
+                        with st.spinner("Rejecting..."):
+                            resume_with_approval(thread_id, False, "dashboard_user")
+                            st.warning("Proposal rejected.")
+                            st.rerun()
 
 st.divider()
 
 
-# ================================================= Panel 4 — live request feed
+# ============================================ Panel 4 — budget utilization
+st.subheader("Budget utilization by tenant")
+
+budget_df = fetch(
+    """
+    SELECT
+        t.id AS tenant_id,
+        t.name AS tenant_name,
+        t.monthly_budget_usd::float AS budget,
+        COALESCE(SUM(r.cost_usd), 0)::float AS spend
+    FROM tenants t
+    LEFT JOIN requests r
+        ON r.tenant_id = t.id
+        AND r.ts >= date_trunc('month', NOW())
+    GROUP BY t.id, t.name, t.monthly_budget_usd
+    ORDER BY spend DESC
+    """
+)
+
+if budget_df.empty:
+    st.info("No tenants configured.")
+else:
+    for _, t_row in budget_df.iterrows():
+        tenant_name = t_row["tenant_name"]
+        budget_val = float(t_row["budget"] or 0)
+        spend_val = float(t_row["spend"] or 0)
+        utilization = (spend_val / budget_val * 100.0) if budget_val > 0 else 0.0
+
+        col_name, col_bar, col_nums = st.columns([1, 3, 1])
+        with col_name:
+            st.markdown(f"**{tenant_name}**")
+        with col_bar:
+            bar_color = "#22c55e" if utilization < 80 else "#f59e0b" if utilization < 100 else "#ef4444"
+            st.progress(min(utilization / 100.0, 1.0))
+        with col_nums:
+            st.caption(f"${spend_val:.2f} / ${budget_val:.2f} ({utilization:.0f}%)")
+
+st.divider()
+
+
+# ================================================= Panel 5 — live request feed
 st.subheader("Recent requests")
 
-panel4_df = fetch(
+panel5_df = fetch(
     """
-    SELECT ts, tag, model, tier, cached, latency_ms,
-           cost_usd::float AS cost_usd, quality_score::float AS quality_score
+    SELECT ts, tenant_id, tag, model, tier, cached, latency_ms,
+           cost_usd::float AS cost_usd, quality_score::float AS quality_score,
+           redacted_entity_count
     FROM requests
     WHERE ts >= $1 AND ts < $2
     ORDER BY ts DESC
@@ -367,36 +448,38 @@ panel4_df = fetch(
     start_ts, end_ts,
 )
 
-if panel4_df.empty:
+if panel5_df.empty:
     st.info("No requests in the selected date range.")
 else:
     tier_emoji = {"low": "🟢", "mid": "🟡", "high": "🔴", "cache": "🟣"}
 
-    display4 = panel4_df.copy()
-    display4["model"]        = display4["model"].apply(_short_model)
-    display4["cached"]       = display4["cached"].map({True: "✓", False: ""})
-    display4["latency_ms"]   = display4["latency_ms"].round(0).astype("Int64")
-    display4["cost_usd"]     = display4["cost_usd"].apply(
+    display5 = panel5_df.copy()
+    display5["model"]        = display5["model"].apply(_short_model)
+    display5["cached"]       = display5["cached"].map({True: "yes", False: ""})
+    display5["latency_ms"]   = display5["latency_ms"].round(0).astype("Int64")
+    display5["cost_usd"]     = display5["cost_usd"].apply(
         lambda c: round(float(c), 6) if pd.notnull(c) else None
     )
-    display4["quality_score"] = display4["quality_score"].apply(
+    display5["quality_score"] = display5["quality_score"].apply(
         lambda q: round(float(q), 2) if pd.notnull(q) else None
     )
-    display4["tier"] = display4["tier"].apply(
+    display5["tier"] = display5["tier"].apply(
         lambda t: f"{tier_emoji.get(t, '')} {_tier_display(t)}"
     )
 
     st.dataframe(
-        display4[["ts", "tag", "model", "tier", "cached",
-                  "latency_ms", "cost_usd", "quality_score"]].rename(columns={
-            "ts":            "Time",
-            "tag":           "Tag",
-            "model":         "Model",
-            "tier":          "Tier",
-            "cached":        "Cached",
-            "latency_ms":    "Latency (ms)",
-            "cost_usd":      "Cost ($)",
-            "quality_score": "Quality",
+        display5[["ts", "tenant_id", "tag", "model", "tier", "cached",
+                  "latency_ms", "cost_usd", "quality_score", "redacted_entity_count"]].rename(columns={
+            "ts":                     "Time",
+            "tenant_id":              "Tenant",
+            "tag":                    "Tag",
+            "model":                  "Model",
+            "tier":                   "Tier",
+            "cached":                 "Cached",
+            "latency_ms":             "Latency (ms)",
+            "cost_usd":               "Cost ($)",
+            "quality_score":          "Quality",
+            "redacted_entity_count":  "PII redacted",
         }),
         hide_index=True,
         use_container_width=True,
